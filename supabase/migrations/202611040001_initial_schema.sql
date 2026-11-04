@@ -10,15 +10,18 @@ create table if not exists public.profiles (
 
 create table if not exists public.categories (
   id uuid primary key default gen_random_uuid(),
-  name text not null unique,
+  name text not null unique check (char_length(btrim(name)) between 1 and 80),
   description text,
   icon text,
+  is_active boolean not null default true,
   created_at timestamptz not null default now()
 );
 
+alter table public.categories add column if not exists is_active boolean not null default true;
+
 create table if not exists public.subjects (
   id uuid primary key default gen_random_uuid(),
-  name text not null,
+  name text not null check (char_length(btrim(name)) between 1 and 100),
   academic_level text not null check (academic_level in ('Ordinary Level (O-Level)', 'Advanced Level (A-Level)')),
   is_active boolean not null default true,
   created_at timestamptz not null default now(),
@@ -69,6 +72,23 @@ create table if not exists public.reports (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.contact_messages (
+  id uuid primary key default gen_random_uuid(),
+  full_name text not null check (char_length(full_name) between 2 and 120),
+  email text not null check (char_length(email) between 3 and 254),
+  subject text not null check (char_length(subject) between 2 and 160),
+  message text not null check (char_length(message) between 5 and 4000),
+  status text not null default 'new' check (status in ('new', 'reviewing', 'resolved')),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.public_submission_attempts (
+  id bigint generated always as identity primary key,
+  purpose text not null check (purpose in ('report', 'contact')),
+  source_hash bigint not null,
+  created_at timestamptz not null default now()
+);
+
 create index if not exists resources_published_recent_idx on public.resources (created_at desc) where status = 'published';
 create index if not exists resources_category_idx on public.resources (category_id);
 create index if not exists resources_subject_idx on public.resources (subject_id);
@@ -80,6 +100,8 @@ create index if not exists resources_search_idx on public.resources using gin (
 );
 create index if not exists downloads_resource_date_idx on public.downloads (resource_id, downloaded_at desc);
 create index if not exists reports_status_date_idx on public.reports (status, created_at desc);
+create index if not exists contact_messages_status_date_idx on public.contact_messages (status, created_at desc);
+create index if not exists public_submission_attempts_lookup_idx on public.public_submission_attempts (purpose, source_hash, created_at desc);
 
 create or replace function public.set_updated_at()
 returns trigger
@@ -233,12 +255,207 @@ begin
 end;
 $$;
 
+create or replace function public.claim_public_submission(submission_purpose text, submission_limit integer, window_seconds integer)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  source_ip text;
+  v_source_hash bigint;
+  recent_attempts bigint;
+begin
+  source_ip := coalesce(
+    nullif(current_setting('request.headers', true)::jsonb ->> 'cf-connecting-ip', ''),
+    nullif(current_setting('request.headers', true)::jsonb ->> 'x-real-ip', '')
+  );
+  if source_ip is null then
+    raise exception 'Could not verify request source';
+  end if;
+
+  v_source_hash := pg_catalog.hashtextextended(submission_purpose || ':' || source_ip, 719234);
+  perform pg_catalog.pg_advisory_xact_lock(v_source_hash);
+  delete from public.public_submission_attempts
+  where created_at < pg_catalog.now() - interval '1 day';
+
+  select count(*) into recent_attempts
+  from public.public_submission_attempts
+  where purpose = submission_purpose
+    and public_submission_attempts.source_hash = v_source_hash
+    and created_at >= pg_catalog.now() - pg_catalog.make_interval(secs => window_seconds);
+
+  if recent_attempts >= submission_limit then
+    return false;
+  end if;
+
+  insert into public.public_submission_attempts (purpose, source_hash)
+  values (submission_purpose, v_source_hash);
+  return true;
+end;
+$$;
+
+create or replace function public.submit_resource_report(resource_uuid uuid, report_reason text, report_description text default null)
+returns uuid
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  report_id uuid;
+begin
+  if report_reason is null or pg_catalog.char_length(pg_catalog.btrim(report_reason)) not between 2 and 120
+    or report_description is not null and pg_catalog.char_length(report_description) > 2000 then
+    raise exception 'Report details are invalid';
+  end if;
+  if not exists (select 1 from public.resources where id = resource_uuid and status = 'published') then
+    raise exception 'Resource is unavailable';
+  end if;
+  if not public.claim_public_submission('report', 8, 3600) then
+    raise exception 'Too many reports. Try again later.';
+  end if;
+
+  insert into public.reports (resource_id, reason, description)
+  values (resource_uuid, pg_catalog.btrim(report_reason), nullif(pg_catalog.btrim(report_description), ''))
+  returning id into report_id;
+  return report_id;
+end;
+$$;
+
+create or replace function public.submit_contact_message(sender_name text, sender_email text, message_subject text, message_body text)
+returns uuid
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  message_id uuid;
+begin
+  if sender_name is null or sender_email is null or message_subject is null or message_body is null
+    or pg_catalog.char_length(pg_catalog.btrim(sender_name)) not between 2 and 120
+    or pg_catalog.char_length(pg_catalog.btrim(sender_email)) not between 3 and 254
+    or sender_email !~* '^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$'
+    or pg_catalog.char_length(pg_catalog.btrim(message_subject)) not between 2 and 160
+    or pg_catalog.char_length(pg_catalog.btrim(message_body)) not between 5 and 4000 then
+    raise exception 'Contact details are invalid';
+  end if;
+  if not public.claim_public_submission('contact', 5, 3600) then
+    raise exception 'Too many messages. Try again later.';
+  end if;
+
+  insert into public.contact_messages (full_name, email, subject, message)
+  values (
+    pg_catalog.btrim(sender_name),
+    pg_catalog.lower(pg_catalog.btrim(sender_email)),
+    pg_catalog.btrim(message_subject),
+    pg_catalog.btrim(message_body)
+  )
+  returning id into message_id;
+  return message_id;
+end;
+$$;
+
+create or replace function public.set_contact_message_status(message_uuid uuid, new_status text)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if not (select public.is_admin()) then
+    raise exception 'Administrator access required';
+  end if;
+  if new_status is null or new_status not in ('new', 'reviewing', 'resolved') then
+    raise exception 'Contact status is invalid';
+  end if;
+  update public.contact_messages set status = new_status where id = message_uuid;
+end;
+$$;
+
+create or replace function public.set_admin_profile_name(new_full_name text)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if not (select public.is_admin()) then
+    raise exception 'Administrator access required';
+  end if;
+  if new_full_name is null or pg_catalog.char_length(pg_catalog.btrim(new_full_name)) not between 2 and 120 then
+    raise exception 'Name must contain 2 to 120 characters';
+  end if;
+  update public.profiles
+  set full_name = pg_catalog.btrim(new_full_name)
+  where id = (select auth.uid());
+end;
+$$;
+
+create or replace function public.set_profile_role(profile_uuid uuid, new_role text)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if not (select public.is_admin()) then
+    raise exception 'Administrator access required';
+  end if;
+  if profile_uuid = (select auth.uid()) then
+    raise exception 'Administrators cannot change their own role';
+  end if;
+  if new_role is null or new_role not in ('student', 'admin') then
+    raise exception 'Role is invalid';
+  end if;
+  update public.profiles set role = new_role where id = profile_uuid;
+  if not found then
+    raise exception 'Profile not found';
+  end if;
+end;
+$$;
+
+create or replace function public.admin_dashboard_stats_v2()
+returns table(
+  total_resources bigint,
+  published_resources bigint,
+  draft_resources bigint,
+  total_downloads bigint,
+  textbook_resources bigint,
+  past_papers bigint,
+  study_notes bigint
+)
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+begin
+  if not (select public.is_admin()) then
+    raise exception 'Administrator access required';
+  end if;
+
+  return query
+  select
+    count(*)::bigint,
+    count(*) filter (where r.status = 'published')::bigint,
+    count(*) filter (where r.status = 'draft')::bigint,
+    coalesce(sum(r.download_count), 0)::bigint,
+    count(*) filter (where c.name = 'Textbooks')::bigint,
+    count(*) filter (where c.name = 'Past Examination Papers')::bigint,
+    count(*) filter (where c.name = 'Study Notes')::bigint
+  from public.resources as r
+  join public.categories as c on c.id = r.category_id;
+end;
+$$;
+
 alter table public.profiles enable row level security;
 alter table public.categories enable row level security;
 alter table public.subjects enable row level security;
 alter table public.resources enable row level security;
 alter table public.downloads enable row level security;
 alter table public.reports enable row level security;
+alter table public.contact_messages enable row level security;
+alter table public.public_submission_attempts enable row level security;
 
 drop policy if exists "Profiles readable by owner or admins" on public.profiles;
 create policy "Profiles readable by owner or admins" on public.profiles for select
@@ -256,7 +473,8 @@ create policy "Admins delete other profiles" on public.profiles for delete
 using ((select public.is_admin()) and id <> (select auth.uid()));
 
 drop policy if exists "Categories readable by everyone" on public.categories;
-create policy "Categories readable by everyone" on public.categories for select using (true);
+create policy "Active categories readable by everyone" on public.categories for select
+using (is_active or (select public.is_admin()));
 drop policy if exists "Admins manage categories" on public.categories;
 create policy "Admins manage categories" on public.categories for all
 using ((select public.is_admin())) with check ((select public.is_admin()));
@@ -285,10 +503,14 @@ drop policy if exists "Admins read downloads" on public.downloads;
 create policy "Admins read downloads" on public.downloads for select
 using ((select public.is_admin()));
 drop policy if exists "Public can report resources" on public.reports;
-create policy "Public can report resources" on public.reports for insert
-with check (exists (select 1 from public.resources where id = resource_id and status = 'published'));
+create policy "Admins read reports" on public.reports for select
+using ((select public.is_admin()));
 drop policy if exists "Admins manage reports" on public.reports;
-create policy "Admins manage reports" on public.reports for all
+create policy "Admins update reports" on public.reports for update
+using ((select public.is_admin())) with check ((select public.is_admin()));
+
+drop policy if exists "Admins manage contact messages" on public.contact_messages;
+create policy "Admins manage contact messages" on public.contact_messages for all
 using ((select public.is_admin())) with check ((select public.is_admin()));
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
@@ -305,6 +527,17 @@ values (
 )
 on conflict (id) do update
 set public = false, file_size_limit = 52428800, allowed_mime_types = excluded.allowed_mime_types;
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'covers',
+  'covers',
+  false,
+  5242880,
+  array['image/jpeg', 'image/png', 'image/webp']
+)
+on conflict (id) do update
+set public = false, file_size_limit = 5242880, allowed_mime_types = excluded.allowed_mime_types;
 
 drop policy if exists "Published resource files are readable" on storage.objects;
 create policy "Published resource files are readable" on storage.objects for select
@@ -329,17 +562,60 @@ drop policy if exists "Admins delete resource files" on storage.objects;
 create policy "Admins delete resource files" on storage.objects for delete
 using (bucket_id = 'documents' and (select public.is_admin()));
 
+drop policy if exists "Published cover images are readable" on storage.objects;
+create policy "Published cover images are readable" on storage.objects for select
+using (
+  bucket_id = 'covers'
+  and (
+    (select public.is_admin())
+    or exists (
+      select 1 from public.resources
+      where resources.cover_image_path = name and resources.status = 'published'
+    )
+  )
+);
+drop policy if exists "Admins upload cover images" on storage.objects;
+create policy "Admins upload cover images" on storage.objects for insert
+with check (bucket_id = 'covers' and (select public.is_admin()));
+drop policy if exists "Admins update cover images" on storage.objects;
+create policy "Admins update cover images" on storage.objects for update
+using (bucket_id = 'covers' and (select public.is_admin()))
+with check (bucket_id = 'covers' and (select public.is_admin()));
+drop policy if exists "Admins delete cover images" on storage.objects;
+create policy "Admins delete cover images" on storage.objects for delete
+using (bucket_id = 'covers' and (select public.is_admin()));
+
+revoke all on function public.record_download(uuid) from public;
+revoke all on function public.search_resource_ids(text) from public;
+revoke all on function public.submit_resource_report(uuid, text, text) from public;
+revoke all on function public.submit_contact_message(text, text, text, text) from public;
+revoke all on function public.is_admin() from public;
 grant execute on function public.record_download(uuid) to anon, authenticated;
 grant execute on function public.search_resource_ids(text) to anon, authenticated;
+grant execute on function public.submit_resource_report(uuid, text, text) to anon, authenticated;
+grant execute on function public.submit_contact_message(text, text, text, text) to anon, authenticated;
+grant execute on function public.is_admin() to anon, authenticated;
 grant execute on function public.admin_dashboard_stats() to authenticated;
+grant execute on function public.admin_dashboard_stats_v2() to authenticated;
+grant execute on function public.set_contact_message_status(uuid, text) to authenticated;
+grant execute on function public.set_admin_profile_name(text) to authenticated;
+grant execute on function public.set_profile_role(uuid, text) to authenticated;
+revoke all on function public.admin_dashboard_stats() from public, anon;
+revoke all on function public.admin_dashboard_stats_v2() from public, anon;
+revoke all on function public.set_contact_message_status(uuid, text) from public, anon;
+revoke all on function public.set_admin_profile_name(text) from public, anon;
+revoke all on function public.set_profile_role(uuid, text) from public, anon;
+revoke all on function public.claim_public_submission(text, integer, integer) from public, anon, authenticated;
 
+revoke all on public.reports, public.contact_messages, public.public_submission_attempts from public, anon, authenticated;
+revoke all on public.profiles, public.categories, public.subjects, public.resources, public.downloads from public, anon, authenticated;
 grant select on public.categories, public.subjects, public.resources to anon, authenticated;
 grant select, insert, update, delete on public.profiles to authenticated;
 grant insert, update, delete on public.categories, public.subjects, public.resources to authenticated;
 grant select on public.downloads to authenticated;
-grant insert on public.reports to anon, authenticated;
-grant select, update, delete on public.reports to authenticated;
-grant execute on function public.is_admin() to anon, authenticated;
+grant select, update on public.reports to authenticated;
+grant select, update, delete on public.contact_messages to authenticated;
+revoke all on public.public_submission_attempts from public, anon, authenticated;
 
 insert into public.categories (name, description, icon) values
   ('Textbooks', 'Core textbooks organized by subject and class.', 'book-open'),

@@ -8,7 +8,8 @@ SOMA SMART is a free digital library for secondary school students in Tanzania. 
 - Database-backed categories, subjects, search, filters, sorting and pagination.
 - Published-only public resource access and private document storage.
 - PDF previews and free document downloads with download counts.
-- Administrator sign-in, resource upload and replacement, edit, publication controls, deletion and taxonomy management.
+- Administrator sign-in, resource upload/replacement, cover-image management, publishing, deletion and taxonomy controls.
+- Contact-message and resource-report inboxes, account-role management and administrator profile settings.
 - Supabase PostgreSQL migrations, seed data, Row Level Security and storage policies.
 
 ## Technology
@@ -52,9 +53,10 @@ The auth trigger creates new profile rows with the non-privileged `student` role
 
 ## Storage and access
 
-- The migration creates the private `documents` bucket with a 50 MiB limit and supported Office/PDF MIME types.
-- Resource documents are stored outside PostgreSQL. Signed preview/download URLs are short-lived.
+- The migration creates private `documents` and `covers` buckets with 50 MiB and 5 MiB limits, respectively.
+- Resource documents and cover images are stored outside PostgreSQL. Signed file and image URLs are short-lived.
 - Public database reads and file reads are limited to published resources. Drafts and all write operations require the administrator role.
+- Contact messages and resource reports are rate-limited using client IP headers supplied by the Supabase API gateway. Confirm that `cf-connecting-ip` or `x-real-ip` is available in your deployment; submissions fail explicitly when the source cannot be verified.
 - PDFs are rendered with PDF.js using page navigation and zoom controls; DOCX and PPTX files are offered as downloads.
 - Browser signature checks complement, but do not replace, server-side storage policies. For a public production deployment requiring malware scanning or deeper document-signature inspection, put uploads behind a trusted server/edge function.
 

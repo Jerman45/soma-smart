@@ -10,9 +10,9 @@ export type Database = {
         Relationships: []
       }
       categories: {
-        Row: { id: string; name: string; description: string | null; icon: string | null; created_at: string }
-        Insert: { id?: string; name: string; description?: string | null; icon?: string | null; created_at?: string }
-        Update: { id?: string; name?: string; description?: string | null; icon?: string | null; created_at?: string }
+        Row: { id: string; name: string; description: string | null; icon: string | null; is_active: boolean; created_at: string }
+        Insert: { id?: string; name: string; description?: string | null; icon?: string | null; is_active?: boolean; created_at?: string }
+        Update: { id?: string; name?: string; description?: string | null; icon?: string | null; is_active?: boolean; created_at?: string }
         Relationships: []
       }
       subjects: {
@@ -57,6 +57,12 @@ export type Database = {
         Update: { id?: string; resource_id?: string; reason?: string; description?: string | null; status?: string; created_at?: string }
         Relationships: [{ foreignKeyName: 'reports_resource_id_fkey'; columns: ['resource_id']; isOneToOne: false; referencedRelation: 'resources'; referencedColumns: ['id'] }]
       }
+      contact_messages: {
+        Row: { id: string; full_name: string; email: string; subject: string; message: string; status: string; created_at: string }
+        Insert: { id?: string; full_name: string; email: string; subject: string; message: string; status?: string; created_at?: string }
+        Update: { id?: string; full_name?: string; email?: string; subject?: string; message?: string; status?: string; created_at?: string }
+        Relationships: []
+      }
     }
     Views: Record<string, never>
     Functions: {
@@ -66,6 +72,15 @@ export type Database = {
         Args: Record<PropertyKey, never>
         Returns: { total_resources: number; published_resources: number; draft_resources: number; total_downloads: number }[]
       }
+      submit_resource_report: { Args: { resource_uuid: string; report_reason: string; report_description?: string | null }; Returns: string }
+      submit_contact_message: { Args: { sender_name: string; sender_email: string; message_subject: string; message_body: string }; Returns: string }
+      set_contact_message_status: { Args: { message_uuid: string; new_status: string }; Returns: undefined }
+      admin_dashboard_stats_v2: {
+        Args: Record<PropertyKey, never>
+        Returns: { total_resources: number; published_resources: number; draft_resources: number; total_downloads: number; textbook_resources: number; past_papers: number; study_notes: number }[]
+      }
+      set_admin_profile_name: { Args: { new_full_name: string }; Returns: undefined }
+      set_profile_role: { Args: { profile_uuid: string; new_role: string }; Returns: undefined }
     }
     Enums: Record<string, never>
     CompositeTypes: Record<string, never>
