@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent } from 'react'
 import {
   ArrowDownToLine,
   ArrowRight,
@@ -60,6 +60,7 @@ import {
   submitContactMessage,
   setResourcePublished,
   updateResource,
+  type UploadProgress,
   type Category,
   type Resource,
   type ResourceReport,
@@ -608,6 +609,10 @@ function AdminPage() {
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null)
+  const [documentDragActive, setDocumentDragActive] = useState(false)
+  const [coverDragActive, setCoverDragActive] = useState(false)
+  const uploadControllerRef = useRef<AbortController | null>(null)
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [categoryId, setCategoryId] = useState('')
@@ -630,6 +635,7 @@ function AdminPage() {
   const [coverImage, setCoverImage] = useState<File | null>(null)
   const [coverPreviewUrl, setCoverPreviewUrl] = useState('')
   const [removeExistingCover, setRemoveExistingCover] = useState(false)
+  const location = useLocation()
   const availableClasses = level === academicLevels[0] ? classLevels.slice(0, 4) : classLevels.slice(4)
   const availableSubjects = subjects.filter((subject) => subject.academic_level === level && (subject.is_active || subject.id === subjectId))
 
@@ -683,14 +689,35 @@ function AdminPage() {
     if (coverPreviewUrl) URL.revokeObjectURL(coverPreviewUrl)
   }, [coverPreviewUrl])
 
+  useEffect(() => {
+    if (!isAdmin) return
+    const sectionIds: Record<string, string> = {
+      '/admin': 'overview',
+      '/admin/dashboard': 'overview',
+      '/admin/upload': 'upload',
+      '/admin/resources': 'manage',
+      '/admin/categories': 'categories',
+      '/admin/subjects': 'subjects',
+    }
+    const sectionId = sectionIds[location.pathname]
+    if (!sectionId) return
+    const frame = window.requestAnimationFrame(() => document.getElementById(sectionId)?.scrollIntoView({ block: 'start' }))
+    return () => window.cancelAnimationFrame(frame)
+  }, [isAdmin, location.pathname])
+
   async function upload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (uploadControllerRef.current) return
     setError('')
     setMessage('')
     if (!supabase) { setError('Supabase is not configured.'); return }
     if (!editingResource && !file) { setError('Choose a PDF, DOCX or PPTX document to upload.'); return }
     if (file && file.size > maxUploadBytes) { setError('The selected document is larger than the 50 MB limit.'); return }
+    const controller = new AbortController()
+    uploadControllerRef.current = controller
     setBusy(true)
+    setUploadProgress({ percent: 0, status: 'Preparing upload…' })
+    const options = { signal: controller.signal, onProgress: setUploadProgress }
     try {
       const details = {
         title, description, categoryId, subjectId, academicLevel: level,
@@ -698,13 +725,14 @@ function AdminPage() {
         keywords: keywords.split(',').map((keyword) => keyword.trim()).filter(Boolean), published,
       }
       if (editingResource) {
-        await updateResource(editingResource, { ...details, file: file ?? undefined, coverImage, removeCover: removeExistingCover })
+        await updateResource(editingResource, { ...details, file: file ?? undefined, coverImage, removeCover: removeExistingCover }, options)
         setMessage(`“${title}” was updated successfully.`)
       } else {
         if (!file) throw new Error('Choose a document to upload.')
-        const result = await addResource({ ...details, file, coverImage })
+        const result = await addResource({ ...details, file, coverImage }, options)
         setMessage(`“${result.title}” was uploaded successfully.`)
       }
+      setUploadProgress({ percent: 100, status: 'Upload complete.' })
       setEditingResource(null)
       setTitle(''); setDescription(''); setCategoryId(''); setSubjectId(''); setYear(''); setAuthor(''); setPublisher(''); setKeywords(''); setFile(null); setCoverImage(null); setCoverPreviewUrl(''); setRemoveExistingCover(false); setPublished(false)
       const input = document.getElementById('document-file') as HTMLInputElement | null
@@ -712,8 +740,55 @@ function AdminPage() {
       const coverInput = document.getElementById('cover-file') as HTMLInputElement | null
       if (coverInput) coverInput.value = ''
       await loadDashboard()
-    } catch (cause) { setError(readableError(cause)) }
-    finally { setBusy(false) }
+    } catch (cause) {
+      if (cause instanceof DOMException && cause.name === 'AbortError') setMessage('Upload canceled. No resource was published.')
+      else setError(readableError(cause))
+    } finally {
+      uploadControllerRef.current = null
+      setBusy(false)
+      setUploadProgress(null)
+    }
+  }
+
+  function cancelUpload() {
+    if (uploadProgress?.status.startsWith('Saving')) return
+    uploadControllerRef.current?.abort()
+  }
+
+  function selectDocument(candidate: File | undefined) {
+    if (!candidate) return
+    const extension = candidate.name.split('.').pop()?.toLowerCase()
+    if (candidate.size <= 0 || candidate.size > maxUploadBytes || !extension || !['pdf', 'docx', 'pptx'].includes(extension)) {
+      setError('Choose a non-empty PDF, DOCX or PPTX file no larger than 50 MB.')
+      return
+    }
+    setError('')
+    setFile(candidate)
+  }
+
+  function selectCover(candidate: File | undefined) {
+    if (!candidate) return
+    const extension = candidate.name.split('.').pop()?.toLowerCase()
+    if (candidate.size <= 0 || candidate.size > 5 * 1024 * 1024 || !extension || !['jpg', 'jpeg', 'png', 'webp'].includes(extension)) {
+      setError('Choose a non-empty JPG, PNG or WEBP image no larger than 5 MB.')
+      return
+    }
+    setError('')
+    setCoverImage(candidate)
+    setCoverPreviewUrl(URL.createObjectURL(candidate))
+    setRemoveExistingCover(false)
+  }
+
+  function handleDocumentDrop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault()
+    setDocumentDragActive(false)
+    selectDocument(event.dataTransfer.files[0])
+  }
+
+  function handleCoverDrop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault()
+    setCoverDragActive(false)
+    selectCover(event.dataTransfer.files[0])
   }
 
   function edit(resource: Resource) {
@@ -731,14 +806,14 @@ function AdminPage() {
     setPublished(resource.status === 'published')
     setFile(null)
     setCoverImage(null)
-    setCoverPreviewUrl('')
+    setCoverPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return '' })
     setRemoveExistingCover(false)
     document.getElementById('upload')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
 
   function cancelEdit() {
     setEditingResource(null)
-    setTitle(''); setDescription(''); setCategoryId(''); setSubjectId(''); setYear(''); setAuthor(''); setPublisher(''); setKeywords(''); setFile(null); setCoverImage(null); setCoverPreviewUrl(''); setRemoveExistingCover(false); setPublished(false)
+    setTitle(''); setDescription(''); setCategoryId(''); setSubjectId(''); setYear(''); setAuthor(''); setPublisher(''); setKeywords(''); setFile(null); setCoverImage(null); setCoverPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return '' }); setRemoveExistingCover(false); setPublished(false)
     const input = document.getElementById('document-file') as HTMLInputElement | null
     if (input) input.value = ''
     const coverInput = document.getElementById('cover-file') as HTMLInputElement | null
@@ -898,11 +973,12 @@ function AdminPage() {
           <div className="form-two-col"><label>Academic level<select value={level} onChange={(event) => { const nextLevel = event.target.value; setLevel(nextLevel); if (subjects.find((subject) => subject.id === subjectId)?.academic_level !== nextLevel) setSubjectId(''); setClassLevel(nextLevel === academicLevels[0] ? 'Form I' : 'Form V') }}>{academicLevels.map((item) => <option key={item}>{item}</option>)}</select></label><label>Class<select value={classLevel} onChange={(event) => setClassLevel(event.target.value)}>{availableClasses.map((item) => <option key={item}>{item}</option>)}</select></label></div>
           <div className="form-two-col"><label>Academic year<input type="number" min="1900" max="2200" value={year} onChange={(event) => setYear(event.target.value)} placeholder="e.g. 2025" /></label><label>Author<input value={author} onChange={(event) => setAuthor(event.target.value)} maxLength={160} /></label></div>
           <label>Publisher<input value={publisher} onChange={(event) => setPublisher(event.target.value)} maxLength={160} /></label>
-          <label className="file-picker" htmlFor="document-file"><Upload size={19} /><span><strong>{file?.name ?? (editingResource ? `Keep current ${editingResource.file_format.toUpperCase()} document or choose a replacement` : 'Choose a learning document')}</strong><small>{file ? `${formatFileSize(file.size)} · ` : ''}PDF, DOCX or PPTX · up to 50 MB</small></span><input id="document-file" type="file" accept=".pdf,.docx,.pptx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation" onChange={(event) => setFile(event.target.files?.[0] ?? null)} required={!editingResource} /></label>
-          <label className="file-picker" htmlFor="cover-file"><BookOpen size={19} /><span><strong>{coverImage?.name ?? (editingResource?.cover_image_path && !removeExistingCover ? 'Keep current cover image or choose a replacement' : 'Choose an optional cover image')}</strong><small>{coverImage ? `${formatFileSize(coverImage.size)} · ` : ''}JPG, PNG or WEBP · up to 5 MB</small></span><input id="cover-file" type="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" onChange={(event) => { const selected = event.target.files?.[0] ?? null; setCoverImage(selected); setCoverPreviewUrl(selected ? URL.createObjectURL(selected) : ''); setRemoveExistingCover(false) }} /></label><SelectedCoverPreview file={coverImage} previewUrl={coverPreviewUrl} />
+          <label className={`file-picker${documentDragActive ? ' file-picker-active' : ''}`} htmlFor="document-file" onDragOver={(event) => { event.preventDefault(); setDocumentDragActive(true) }} onDragLeave={() => setDocumentDragActive(false)} onDrop={handleDocumentDrop}><Upload size={19} /><span><strong>{file?.name ?? (editingResource ? `Keep current ${editingResource.file_format.toUpperCase()} document or choose a replacement` : 'Choose or drop a learning document')}</strong><small>{file ? `${formatFileSize(file.size)} · ` : ''}PDF, DOCX or PPTX · up to 50 MB</small></span><input id="document-file" type="file" accept=".pdf,.docx,.pptx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation" onChange={(event) => selectDocument(event.target.files?.[0])} required={!editingResource} /></label>
+          <label className={`file-picker${coverDragActive ? ' file-picker-active' : ''}`} htmlFor="cover-file" onDragOver={(event) => { event.preventDefault(); setCoverDragActive(true) }} onDragLeave={() => setCoverDragActive(false)} onDrop={handleCoverDrop}><BookOpen size={19} /><span><strong>{coverImage?.name ?? (editingResource?.cover_image_path && !removeExistingCover ? 'Keep current cover image or choose a replacement' : 'Choose or drop an optional cover image')}</strong><small>{coverImage ? `${formatFileSize(coverImage.size)} · ` : ''}JPG, PNG or WEBP · up to 5 MB</small></span><input id="cover-file" type="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" onChange={(event) => selectCover(event.target.files?.[0])} /></label><SelectedCoverPreview file={coverImage} previewUrl={coverPreviewUrl} />
           {editingResource?.cover_image_path && !coverImage && <button className="cover-remove" type="button" aria-pressed={removeExistingCover} onClick={() => setRemoveExistingCover((remove) => !remove)}>{removeExistingCover ? 'Keep current cover image' : 'Remove current cover image'}</button>}
           <label className="publish-option"><input type="checkbox" checked={published} onChange={(event) => setPublished(event.target.checked)} /><span><strong>Publish immediately</strong><small>Leave unchecked to save as an unpublished draft.</small></span></label>
           <button className="button button-primary upload-submit" disabled={busy}>{busy ? 'Saving resource…' : editingResource ? 'Save changes' : 'Upload resource'} <ArrowRight size={16} /></button>
+          {uploadProgress && <div className="upload-progress" role="status"><div><span>{uploadProgress.status}</span><strong>{uploadProgress.percent}%</strong></div><progress value={uploadProgress.percent} max="100" />{uploadControllerRef.current && !uploadProgress.status.startsWith('Saving') && <button className="table-action" type="button" onClick={cancelUpload}>Cancel upload</button>}</div>}
           {editingResource && <button className="button button-secondary upload-submit" type="button" onClick={cancelEdit}>Cancel editing</button>}
         </form>
         <section className="admin-resources" id="manage">

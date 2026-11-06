@@ -215,10 +215,104 @@ export async function setContactMessageStatus(id: string, status: ContactMessage
   if (error) failRequest('The contact message status could not be changed. Please try again.', error)
 }
 
-async function uploadDocument(database: ReturnType<typeof client>, file: File, resourceId: string) {
+export type UploadProgress = { percent: number; status: string }
+export type UploadOptions = {
+  signal: AbortSignal
+  onProgress: (progress: UploadProgress) => void
+}
+
+function uploadStorageFile(
+  database: ReturnType<typeof client>,
+  bucket: 'documents' | 'covers',
+  path: string,
+  file: File,
+  contentType: string,
+  options: UploadOptions,
+  progressRange: { start: number; end: number; status: string },
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest()
+    const abort = () => request.abort()
+    const removeAbortListener = () => options.signal.removeEventListener('abort', abort)
+    const fail = (cause: unknown, message: string) => {
+      removeAbortListener()
+      console.error(`SOMA SMART ${bucket} upload failed`, cause)
+      reject(new Error(message))
+    }
+
+    options.signal.addEventListener('abort', abort, { once: true })
+    request.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        const ratio = event.total ? event.loaded / event.total : 0
+        options.onProgress({
+          percent: Math.round(progressRange.start + ratio * (progressRange.end - progressRange.start)),
+          status: progressRange.status,
+        })
+      }
+    }
+    request.onerror = () => fail(new Error('Network request failed'), 'Upload failed. Check your connection and try again.')
+    request.onabort = () => {
+      removeAbortListener()
+      reject(new DOMException('Upload canceled.', 'AbortError'))
+    }
+    request.onload = () => {
+      removeAbortListener()
+      if (request.status >= 200 && request.status < 300) {
+        resolve()
+        return
+      }
+      let detail = `Storage request failed with status ${request.status}.`
+      try {
+        const response = JSON.parse(request.responseText) as { message?: string; error?: string }
+        detail = response.message ?? response.error ?? detail
+      } catch {
+        // Keep the status-based error when Storage returns a non-JSON response.
+      }
+      console.error(`SOMA SMART ${bucket} upload returned an error`, detail)
+      reject(new Error(detail))
+    }
+
+    void database.auth.getSession().then(({ data, error }) => {
+      if (error) {
+        fail(error, 'Your administrator session could not be verified. Sign in again.')
+        return
+      }
+      if (!data.session) {
+        fail(new Error('No active session'), 'Your administrator session has expired. Sign in again.')
+        return
+      }
+      if (options.signal.aborted) {
+        request.abort()
+        return
+      }
+      const objectPath = path.split('/').map(encodeURIComponent).join('/')
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
+      const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+      if (!supabaseUrl || !supabaseKey) {
+        fail(new Error('Supabase storage configuration is missing'), 'Supabase storage is not configured. Please try again later.')
+        return
+      }
+      request.open('POST', `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/${bucket}/${objectPath}`)
+      request.setRequestHeader('apikey', supabaseKey)
+      request.setRequestHeader('authorization', `Bearer ${data.session.access_token}`)
+      request.setRequestHeader('content-type', contentType)
+      request.setRequestHeader('x-upsert', 'false')
+      request.send(file)
+    }).catch((cause: unknown) => fail(cause, 'Your administrator session could not be verified. Sign in again.'))
+  })
+}
+
+async function uploadDocument(
+  database: ReturnType<typeof client>,
+  file: File,
+  resourceId: string,
+  options: UploadOptions,
+  progressRange: { start: number; end: number; status: string },
+) {
   if (file.size <= 0 || file.size > 50 * 1024 * 1024) throw new Error('Choose a document no larger than 50 MB.')
   const extension = file.name.split('.').pop()?.toLowerCase()
   if (!extension || !['pdf', 'docx', 'pptx'].includes(extension)) throw new Error('Only PDF, DOCX and PPTX documents are supported.')
+  if (options.signal.aborted) throw new DOMException('Upload canceled.', 'AbortError')
   const bytes = new Uint8Array(await file.slice(0, 8).arrayBuffer())
   const isPdf = extension === 'pdf' && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46
   const isOfficeDocument = ['docx', 'pptx'].includes(extension) && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04
@@ -229,14 +323,31 @@ async function uploadDocument(database: ReturnType<typeof client>, file: File, r
     : extension === 'docx'
       ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
       : 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-  const { error } = await database.storage.from('documents').upload(path, file, { contentType, upsert: false })
-  if (error) failRequest('Document upload failed. Check the file and try again.', error)
+  try {
+    await uploadStorageFile(database, 'documents', path, file, contentType, options, progressRange)
+  } catch (cause) {
+    if (cause instanceof DOMException && cause.name === 'AbortError') {
+      const { error: cleanupError } = await database.storage.from('documents').remove([path])
+      if (cleanupError) {
+        console.error('SOMA SMART canceled document cleanup failed', cleanupError)
+        throw new Error('The upload was canceled, but its partial file could not be removed. Contact an administrator.')
+      }
+    }
+    throw cause
+  }
   return { path, extension }
 }
 
-async function uploadCover(database: ReturnType<typeof client>, file: File | null | undefined, resourceId: string) {
+async function uploadCover(
+  database: ReturnType<typeof client>,
+  file: File | null | undefined,
+  resourceId: string,
+  options: UploadOptions,
+  progressRange: { start: number; end: number; status: string },
+) {
   if (!file) return null
   if (file.size <= 0 || file.size > 5 * 1024 * 1024) throw new Error('Choose a cover image no larger than 5 MB.')
+  if (options.signal.aborted) throw new DOMException('Upload canceled.', 'AbortError')
   const extension = file.name.split('.').pop()?.toLowerCase()
   const header = new Uint8Array(await file.slice(0, 12).arrayBuffer())
   const imageTypes = [
@@ -248,8 +359,18 @@ async function uploadCover(database: ReturnType<typeof client>, file: File | nul
   const imageType = imageTypes.find((type) => type.extension === extension && type.matches())
   if (!imageType) throw new Error('The image contents do not match a valid JPG, PNG or WEBP file.')
   const path = `${resourceId}/${crypto.randomUUID()}.${imageType.extension}`
-  const { error } = await database.storage.from('covers').upload(path, file, { contentType: imageType.contentType, upsert: false })
-  if (error) failRequest('Cover image upload failed. Check the image and try again.', error)
+  try {
+    await uploadStorageFile(database, 'covers', path, file, imageType.contentType, options, progressRange)
+  } catch (cause) {
+    if (cause instanceof DOMException && cause.name === 'AbortError') {
+      const { error: cleanupError } = await database.storage.from('covers').remove([path])
+      if (cleanupError) {
+        console.error('SOMA SMART canceled cover cleanup failed', cleanupError)
+        throw new Error('The upload was canceled, but its partial cover image could not be removed. Contact an administrator.')
+      }
+    }
+    throw cause
+  }
   return path
 }
 
@@ -257,16 +378,29 @@ export async function addResource(input: {
   title: string; description: string; categoryId: string; subjectId: string; academicLevel: string
   classLevel: string; academicYear: number | null; author: string; publisher: string; keywords: string[]
   file: File; coverImage?: File | null; published: boolean
-}): Promise<{ title: string }> {
+}, options: UploadOptions): Promise<{ title: string }> {
   const database = client()
   const { data: { user }, error: userError } = await database.auth.getUser()
   if (userError) failRequest('Your administrator session could not be verified. Sign in again.', userError)
   if (!user) throw new Error('Your administrator session has expired. Sign in again.')
   const resourceId = crypto.randomUUID()
-  const { path: filePath, extension } = await uploadDocument(database, input.file, resourceId)
+  const documentEnd = input.coverImage ? 80 : 90
+  const { path: filePath, extension } = await uploadDocument(
+    database,
+    input.file,
+    resourceId,
+    options,
+    { start: 0, end: documentEnd, status: 'Uploading document…' },
+  )
   let coverPath: string | null
   try {
-    coverPath = await uploadCover(database, input.coverImage, resourceId)
+    coverPath = await uploadCover(
+      database,
+      input.coverImage,
+      resourceId,
+      options,
+      { start: documentEnd, end: 95, status: 'Uploading cover image…' },
+    )
   } catch (cause) {
     const { error: cleanupError } = await database.storage.from('documents').remove([filePath])
     if (cleanupError) {
@@ -275,6 +409,18 @@ export async function addResource(input: {
     }
     throw cause
   }
+  if (options.signal.aborted) {
+    const { error: documentCleanupError } = await database.storage.from('documents').remove([filePath])
+    const { error: coverCleanupError } = coverPath
+      ? await database.storage.from('covers').remove([coverPath])
+      : { error: null }
+    if (documentCleanupError || coverCleanupError) {
+      console.error('SOMA SMART canceled resource cleanup failed', documentCleanupError ?? coverCleanupError)
+      throw new Error('The upload was canceled, but an uploaded file could not be removed. Contact an administrator.')
+    }
+    throw new DOMException('Upload canceled.', 'AbortError')
+  }
+  options.onProgress({ percent: 97, status: 'Saving resource details…' })
   const { error: insertError } = await database.from('resources').insert({
     id: resourceId,
     title: input.title.trim(),
@@ -313,12 +459,20 @@ export async function updateResource(resource: Resource, input: {
   title: string; description: string; categoryId: string; subjectId: string; academicLevel: string
   classLevel: string; academicYear: number | null; author: string; publisher: string; keywords: string[]
   published: boolean; file?: File; coverImage?: File | null; removeCover?: boolean
-}): Promise<void> {
+}, options: UploadOptions): Promise<void> {
   const database = client()
-  const replacement = input.file ? await uploadDocument(database, input.file, resource.id) : null
+  const uploadCount = Number(Boolean(input.file)) + Number(Boolean(input.coverImage))
+  const documentEnd = uploadCount === 2 ? 80 : 90
+  const replacement = input.file
+    ? await uploadDocument(database, input.file, resource.id, options, { start: 0, end: documentEnd, status: 'Uploading replacement document…' })
+    : null
   let replacementCover: string | null = null
   try {
-    replacementCover = await uploadCover(database, input.coverImage, resource.id)
+    replacementCover = await uploadCover(database, input.coverImage, resource.id, options, {
+      start: replacement ? documentEnd : 0,
+      end: uploadCount === 2 ? 95 : 90,
+      status: 'Uploading cover image…',
+    })
   } catch (cause) {
     if (replacement) {
       const { error: cleanupError } = await database.storage.from('documents').remove([replacement.path])
@@ -329,6 +483,20 @@ export async function updateResource(resource: Resource, input: {
     }
     throw cause
   }
+  if (options.signal.aborted) {
+    const { error: documentCleanupError } = replacement
+      ? await database.storage.from('documents').remove([replacement.path])
+      : { error: null }
+    const { error: coverCleanupError } = replacementCover
+      ? await database.storage.from('covers').remove([replacementCover])
+      : { error: null }
+    if (documentCleanupError || coverCleanupError) {
+      console.error('SOMA SMART canceled replacement cleanup failed', documentCleanupError ?? coverCleanupError)
+      throw new Error('The upload was canceled, but a replacement file could not be removed. Contact an administrator.')
+    }
+    throw new DOMException('Upload canceled.', 'AbortError')
+  }
+  options.onProgress({ percent: 97, status: 'Saving resource details…' })
   const { error } = await database.from('resources').update({
     title: input.title.trim(),
     description: input.description.trim() || null,
