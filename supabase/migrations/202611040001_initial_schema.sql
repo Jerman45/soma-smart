@@ -95,8 +95,23 @@ create index if not exists resources_subject_idx on public.resources (subject_id
 create index if not exists resources_level_class_idx on public.resources (academic_level, class_level);
 create index if not exists resources_year_idx on public.resources (academic_year);
 create index if not exists resources_download_count_idx on public.resources (download_count desc) where status = 'published';
+create or replace function public.resources_search_vector(
+  p_title text,
+  p_description text,
+  p_keywords text[]
+)
+returns tsvector
+language sql
+immutable
+set search_path = ''
+as $$
+  select to_tsvector(
+    'simple'::regconfig,
+    coalesce(p_title, '') || ' ' || coalesce(p_description, '') || ' ' || coalesce(array_to_string(p_keywords, ' '), '')
+  );
+$$;
 create index if not exists resources_search_idx on public.resources using gin (
-  to_tsvector('simple', coalesce(title, '') || ' ' || coalesce(description, '') || ' ' || array_to_string(keywords, ' '))
+  public.resources_search_vector(title, description, keywords)
 );
 create index if not exists downloads_resource_date_idx on public.downloads (resource_id, downloaded_at desc);
 create index if not exists reports_status_date_idx on public.reports (status, created_at desc);

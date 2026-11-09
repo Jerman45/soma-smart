@@ -76,10 +76,32 @@ const contactEmail = import.meta.env.VITE_CONTACT_EMAIL?.trim()
 const PdfPreview = lazy(() => import('./components/PdfPreview'))
 
 const resourceTypes = [
+  { title: 'TIE books', description: 'Official TIE textbooks aligned to the curriculum.', icon: BookOpen, category: 'TIE Books' },
   { title: 'Textbooks', description: 'Core books for every subject and class.', icon: BookOpen, category: 'Textbooks' },
   { title: 'Past papers', description: 'Prepare with previous examination papers.', icon: FileText, category: 'Past Examination Papers' },
   { title: 'Study notes', description: 'Clear notes to make complex topics simpler.', icon: BookText, category: 'Study Notes' },
-  { title: 'Mock exams', description: 'Practice under exam-style conditions.', icon: Layers3, category: 'Mock Examinations' },
+]
+
+type MaterialPreset = {
+  id: string
+  label: string
+  categoryNames: string[]
+  publisher?: string
+  keywords?: string
+  descriptionHint?: string
+  titleHint?: string
+}
+
+const materialPresets: MaterialPreset[] = [
+  { id: '', label: 'Choose material type (recommended)', categoryNames: [] },
+  { id: 'tie-book', label: 'TIE Book (official textbook)', categoryNames: ['TIE Books', 'Textbooks'], publisher: 'Tanzania Institute of Education (TIE)', keywords: 'TIE, textbook, curriculum', descriptionHint: 'Official TIE curriculum book. Include edition, subject coverage, and class/form.', titleHint: 'e.g. Physics for Secondary Schools — Form II (TIE)' },
+  { id: 'textbook', label: 'Textbook / Book', categoryNames: ['Textbooks', 'TIE Books'], keywords: 'textbook, book', descriptionHint: 'Include edition/publisher details and what learners will cover.', titleHint: 'e.g. Basic Mathematics Student Book — Form I' },
+  { id: 'past-paper', label: 'Past Examination Paper', categoryNames: ['Past Examination Papers', 'National Examinations'], keywords: 'past paper, examination, revision', descriptionHint: 'Include exam body, year/session, subject, and paper number if applicable.', titleHint: 'e.g. CSEE Biology 2024 — Paper 1' },
+  { id: 'necta', label: 'NECTA / National Examination', categoryNames: ['National Examinations', 'Past Examination Papers'], keywords: 'NECTA, national examination, past paper', descriptionHint: 'Include NECTA exam name, year, and paper details.', titleHint: 'e.g. NECTA CSEE Mathematics 2023' },
+  { id: 'mock', label: 'Mock / Pre-National Exam', categoryNames: ['Mock Examinations'], keywords: 'mock exam, pre-national, practice', descriptionHint: 'Include school/region/body, year, and exam type.', titleHint: 'e.g. Regional Mock Examination — Chemistry Form IV 2025' },
+  { id: 'notes', label: 'Study Notes / Revision Material', categoryNames: ['Study Notes', 'Revision Materials'], keywords: 'study notes, revision, summary', descriptionHint: 'Summarize the topic coverage and intended class/form.', titleHint: 'e.g. Civics Revision Notes — Form III' },
+  { id: 'guide', label: 'Syllabus / Subject Guide', categoryNames: ['Subject Guides', 'Examination Guidelines', 'Educational Documents'], keywords: 'syllabus, guide, curriculum', descriptionHint: 'Include the curriculum area, level, and purpose of the guide.', titleHint: 'e.g. O-Level Physics Syllabus Guide' },
+  { id: 'other', label: 'Other important learning material', categoryNames: ['Other Learning Resources', 'Educational Documents', 'Assignments'], keywords: 'learning resource', descriptionHint: 'Describe why this material is useful and who it is for.', titleHint: 'e.g. Practical Science Workbook — Form II' },
 ]
 
 const classLevels = ['Form I', 'Form II', 'Form III', 'Form IV', 'Form V', 'Form VI']
@@ -586,13 +608,39 @@ function AdminLoginPage() {
     setError('')
     if (!supabase) { setError('Administrator login is not configured. Add the Supabase settings first.'); return }
     setBusy(true)
-    const { error: authError } = await supabase.auth.signInWithPassword({ email, password })
+    const { data: authData, error: authError } = await supabase.auth.signInWithPassword({ email, password })
+    if (authError) {
+      console.error('SOMA SMART administrator sign-in failed', authError)
+      setError('Sign-in failed. Check your email and password, then try again.')
+      setBusy(false)
+      return
+    }
+    const user = authData.user
+    if (!user) {
+      await supabase.auth.signOut()
+      setError('Sign-in failed. Please try again.')
+      setBusy(false)
+      return
+    }
+    const { data: profile, error: profileError } = await supabase.from('profiles').select('role').eq('id', user.id).maybeSingle()
+    if (profileError) {
+      console.error('SOMA SMART administrator role lookup failed', profileError)
+      await supabase.auth.signOut()
+      setError('Administrator access could not be verified. Please try again.')
+      setBusy(false)
+      return
+    }
+    if (profile?.role !== 'admin') {
+      await supabase.auth.signOut()
+      setError('Access denied. Only authorized administrators can sign in.')
+      setBusy(false)
+      return
+    }
     setBusy(false)
-    if (authError) { console.error('SOMA SMART administrator sign-in failed', authError); setError('Sign-in failed. Check your email and password, then try again.'); return }
     navigate('/admin')
   }
 
-  return <main className="login-page"><form className="login-card" onSubmit={login}><span className="login-logo"><LockKeyhole size={21} /></span><span className="eyebrow eyebrow-dark">SOMA SMART ADMINISTRATION</span><h1>Welcome back.</h1><p>Sign in with your authorized administrator account.</p><label>Email address<input type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} required /></label><label>Password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>{error && <p className="inline-error" role="alert">{error}</p>}<button className="button button-primary login-submit" disabled={busy}>{busy ? 'Signing in…' : 'Sign in securely'} <ArrowRight size={16} /></button><Link className="back-link" to="/">← Back to SOMA SMART</Link></form></main>
+  return <main className="login-page"><form className="login-card" onSubmit={login}><span className="login-logo"><LockKeyhole size={21} /></span><span className="eyebrow eyebrow-dark">SOMA SMART ADMINISTRATION</span><h1>Administrator sign in</h1><p>This area is restricted. Only authorized SOMA SMART administrators can sign in.</p><label>Email address<input type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} required /></label><label>Password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>{error && <p className="inline-error" role="alert">{error}</p>}<button className="button button-primary login-submit" disabled={busy}>{busy ? 'Signing in…' : 'Sign in securely'} <ArrowRight size={16} /></button><small>Public/student sign-in is not available. Contact the site owner if you need administrator access.</small><Link className="back-link" to="/">← Back to SOMA SMART</Link></form></main>
 }
 
 function AdminPage() {
@@ -623,6 +671,7 @@ function AdminPage() {
   const [author, setAuthor] = useState('')
   const [publisher, setPublisher] = useState('')
   const [keywords, setKeywords] = useState('')
+  const [materialPreset, setMaterialPreset] = useState('')
   const [published, setPublished] = useState(false)
   const [file, setFile] = useState<File | null>(null)
   const [editingResource, setEditingResource] = useState<Resource | null>(null)
@@ -638,6 +687,23 @@ function AdminPage() {
   const location = useLocation()
   const availableClasses = level === academicLevels[0] ? classLevels.slice(0, 4) : classLevels.slice(4)
   const availableSubjects = subjects.filter((subject) => subject.academic_level === level && (subject.is_active || subject.id === subjectId))
+  const selectedPreset = materialPresets.find((preset) => preset.id === materialPreset) ?? materialPresets[0]
+  const matchedPresetCategory = selectedPreset.categoryNames
+    .map((name) => categories.find((category) => category.name.toLowerCase() === name.toLowerCase()))
+    .find(Boolean)
+
+  function applyMaterialPreset(presetId: string) {
+    setMaterialPreset(presetId)
+    const preset = materialPresets.find((entry) => entry.id === presetId)
+    if (!preset || !preset.id) return
+    const matchedCategory = preset.categoryNames
+      .map((name) => categories.find((category) => category.name.toLowerCase() === name.toLowerCase()))
+      .find(Boolean)
+    if (matchedCategory) setCategoryId(matchedCategory.id)
+    if (preset.publisher && !publisher.trim()) setPublisher(preset.publisher)
+    if (preset.keywords && !keywords.trim()) setKeywords(preset.keywords)
+    if (preset.descriptionHint && !description.trim()) setDescription(preset.descriptionHint)
+  }
 
   async function loadDashboard() {
     if (!supabase) return
@@ -645,8 +711,8 @@ function AdminPage() {
     if (userError) { console.error('SOMA SMART administrator identity lookup failed', userError); setError('Administrator access could not be verified. Please sign in again.'); setIsAdmin(false); return }
     if (!user) { setIsAdmin(false); return }
     const { data: profile, error: profileError } = await supabase.from('profiles').select('role').eq('id', user.id).maybeSingle()
-    if (profileError) { console.error('SOMA SMART administrator profile lookup failed', profileError); setError('Administrator access could not be verified. Please sign in again.'); setIsAdmin(false); return }
-    if (profile?.role !== 'admin') { setIsAdmin(false); return }
+    if (profileError) { console.error('SOMA SMART administrator profile lookup failed', profileError); await supabase.auth.signOut(); setError('Administrator access could not be verified. Please sign in again.'); setIsAdmin(false); return }
+    if (profile?.role !== 'admin') { await supabase.auth.signOut(); setIsAdmin(false); return }
     try {
       const [result, nextCategories, nextSubjects, nextStats, nextReports, nextContactMessages, nextProfiles] = await Promise.all([
         getResources({ limit: 1000, includeUnpublished: true, sort: 'recent' }),
@@ -734,7 +800,7 @@ function AdminPage() {
       }
       setUploadProgress({ percent: 100, status: 'Upload complete.' })
       setEditingResource(null)
-      setTitle(''); setDescription(''); setCategoryId(''); setSubjectId(''); setYear(''); setAuthor(''); setPublisher(''); setKeywords(''); setFile(null); setCoverImage(null); setCoverPreviewUrl(''); setRemoveExistingCover(false); setPublished(false)
+      setTitle(''); setDescription(''); setCategoryId(''); setSubjectId(''); setYear(''); setAuthor(''); setPublisher(''); setKeywords(''); setMaterialPreset(''); setFile(null); setCoverImage(null); setCoverPreviewUrl(''); setRemoveExistingCover(false); setPublished(false)
       const input = document.getElementById('document-file') as HTMLInputElement | null
       if (input) input.value = ''
       const coverInput = document.getElementById('cover-file') as HTMLInputElement | null
@@ -803,6 +869,7 @@ function AdminPage() {
     setAuthor(resource.author ?? '')
     setPublisher(resource.publisher ?? '')
     setKeywords(resource.keywords.join(', '))
+    setMaterialPreset('')
     setPublished(resource.status === 'published')
     setFile(null)
     setCoverImage(null)
@@ -813,7 +880,7 @@ function AdminPage() {
 
   function cancelEdit() {
     setEditingResource(null)
-    setTitle(''); setDescription(''); setCategoryId(''); setSubjectId(''); setYear(''); setAuthor(''); setPublisher(''); setKeywords(''); setFile(null); setCoverImage(null); setCoverPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return '' }); setRemoveExistingCover(false); setPublished(false)
+    setTitle(''); setDescription(''); setCategoryId(''); setSubjectId(''); setYear(''); setAuthor(''); setPublisher(''); setKeywords(''); setMaterialPreset(''); setFile(null); setCoverImage(null); setCoverPreviewUrl((current) => { if (current) URL.revokeObjectURL(current); return '' }); setRemoveExistingCover(false); setPublished(false)
     const input = document.getElementById('document-file') as HTMLInputElement | null
     if (input) input.value = ''
     const coverInput = document.getElementById('cover-file') as HTMLInputElement | null
@@ -966,9 +1033,10 @@ function AdminPage() {
       <div className="admin-columns">
         <form className="admin-form-card" id="upload" onSubmit={upload}>
           <div className="admin-card-heading"><div><span className="eyebrow eyebrow-dark">{editingResource ? 'EDIT YOUR RESOURCE' : 'ADD TO THE LIBRARY'}</span><h2>{editingResource ? 'Edit resource' : 'Upload a resource'}</h2></div><Upload size={19} /></div>
-          <label>Resource title<input value={title} onChange={(event) => setTitle(event.target.value)} required maxLength={180} /></label>
-          <label>Description<textarea value={description} onChange={(event) => setDescription(event.target.value)} rows={3} maxLength={4000} /></label>
-          <label>Keywords (comma separated)<input value={keywords} onChange={(event) => setKeywords(event.target.value)} placeholder="e.g. algebra, revision, NECTA" /></label>
+          {!editingResource && <label>What are you uploading?<select value={materialPreset} onChange={(event) => applyMaterialPreset(event.target.value)}>{materialPresets.map((preset) => <option key={preset.id || 'custom'} value={preset.id}>{preset.label}</option>)}</select><small>{selectedPreset.id ? (matchedPresetCategory ? `Suggested category: ${matchedPresetCategory.name}. You can still change any field.` : `Suggested categories: ${selectedPreset.categoryNames.join(', ')}. If one is missing, add it in Categories & subjects below.`) : 'Select a type to get smart suggestions for TIE books, textbooks, past papers, exams, notes, and other materials.'}</small></label>}
+          <label>Resource title<input value={title} onChange={(event) => setTitle(event.target.value)} required maxLength={180} placeholder={selectedPreset.titleHint ?? 'Clear title students can search for'} /></label>
+          <label>Description<textarea value={description} onChange={(event) => setDescription(event.target.value)} rows={3} maxLength={4000} placeholder={selectedPreset.descriptionHint ?? 'Describe the material, coverage, and who it helps.'} /></label>
+          <label>Keywords (comma separated)<input value={keywords} onChange={(event) => setKeywords(event.target.value)} placeholder={selectedPreset.keywords ?? 'e.g. algebra, revision, NECTA, TIE'} /></label>
           <div className="form-two-col"><label>Category<select value={categoryId} onChange={(event) => setCategoryId(event.target.value)} required><option value="">Choose category</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></label><label>Subject<select value={subjectId} onChange={(event) => setSubjectId(event.target.value)}><option value="">Choose subject (optional)</option>{availableSubjects.map((subject) => <option value={subject.id} key={subject.id}>{subject.name}</option>)}</select></label></div>
           <div className="form-two-col"><label>Academic level<select value={level} onChange={(event) => { const nextLevel = event.target.value; setLevel(nextLevel); if (subjects.find((subject) => subject.id === subjectId)?.academic_level !== nextLevel) setSubjectId(''); setClassLevel(nextLevel === academicLevels[0] ? 'Form I' : 'Form V') }}>{academicLevels.map((item) => <option key={item}>{item}</option>)}</select></label><label>Class<select value={classLevel} onChange={(event) => setClassLevel(event.target.value)}>{availableClasses.map((item) => <option key={item}>{item}</option>)}</select></label></div>
           <div className="form-two-col"><label>Academic year<input type="number" min="1900" max="2200" value={year} onChange={(event) => setYear(event.target.value)} placeholder="e.g. 2025" /></label><label>Author<input value={author} onChange={(event) => setAuthor(event.target.value)} maxLength={160} /></label></div>
